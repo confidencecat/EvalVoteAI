@@ -1,232 +1,58 @@
-# EvalVoteAI.py
-# v1.1: 그래프에 격자(표) 표시, 값 라벨 추가, 한글 폰트 자동 설정 포함
-# 나머지 로직은 v1과 동일 (비동기 구조, JSON 안전 파싱, SYS/SUB 분리, 소그룹 순차·내부 병렬 등)
 
 import os
 import json
 import re
+
 import random
+import shutil
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from dotenv import load_dotenv
 import google.generativeai as genai
 import matplotlib.pyplot as plt
-from matplotlib import font_manager, rcParams
 
-# ---------------------------------
-# 기본 설정/유틸
-# ---------------------------------
-
-load_dotenv()
-GEMINI_MODEL = 'gemini-2.0-flash'
-
-
-def _set_korean_font():
-    try:
-        candidates = [
-            'Malgun Gothic',        # Windows
-            'AppleGothic',          # macOS
-            'NanumGothic',          # Linux/Windows/macOS
-            'Noto Sans CJK KR',
-            'Noto Sans KR',
-            'Batang', 'Gulim'
-        ]
-        available = {f.name for f in font_manager.fontManager.ttflist}
-        for name in candidates:
-            if name in available:
-                rcParams['font.family'] = [name]
-                break
-        else:
-            rcParams['font.family'] = ['DejaVu Sans']
-        rcParams['axes.unicode_minus'] = False
-    except Exception:
-        rcParams['font.family'] = ['DejaVu Sans']
-        rcParams['axes.unicode_minus'] = False
+# config.py에서 공통 설정/함수 import
+from config import (
+    GEMINI_MODEL,
+    set_korean_font,
+    load_json,
+    save_json,
+    load_api_keys,
+    sanitize_folder
+)
 
 
-_set_korean_font()
-
-def load_json(path):
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return []
-
-
-def save_json(path, data):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-
-def save_memory(entry, memory_file):
-    mem = load_json(memory_file)
-    mem.append(entry)
-    save_json(memory_file, mem)
+# 메모리 관리, 시스템 메시지, 프롬프트 등 config.py에서 import
+from config import (
+    save_memory,
+    history_str,
+    last_n_history,
+    SYS_SYSTEM,
+    SYS_FINE,
+    SUB_SYSTEM,
+    SYS1_DIALOG_SYSTEM,
+    SYS2_SUMMARIZER_SYSTEM,
+    build_sub_prompt,
+    build_vote_prompt
+)
+# 한글 폰트 설정
+set_korean_font()
 
 
-def history_str(buf):
-    s = ''
-    for msg in buf:
-        s += f"{msg['role']}: {msg['content']}\n"
-    return s
 
 
-def last_n_history(memory_file, n=10):
-    mem = load_json(memory_file)
-    return mem[-n:] if mem else []
-
-
-def sanitize_folder(name, max_len=60):
-    s = re.sub(r'[^\w\s-]', '', name).strip()
-    s = re.sub(r'\s+', '_', s)
-    return s[:max_len] if len(s) > max_len else s
-
-
-# === 모델 출력에서 JSON만 안전 추출 ===
-
-def _strip_code_fence(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
-    s = re.sub(r'\s*```\s*$', '', s)
-    return s.strip()
-
-
-def extract_json_array(text: str):
-    if not text or not text.strip():
-        raise ValueError('empty')
-    text = _strip_code_fence(text)
-    l = text.find('[')
-    r = text.rfind(']')
-    if l != -1 and r != -1 and r > l:
-        candidate = text[l:r + 1]
-        return json.loads(candidate)
-    l = text.find('{')
-    r = text.rfind('}')
-    if l != -1 and r != -1 and r > l:
-        candidate = '[' + text[l:r + 1] + ']'
-        return json.loads(candidate)
-    raise ValueError('no json found')
-
-
-# ---------------------------------
-# API 키 자동 로딩 (SYS_n, SUB_n, (없으면) API_n)
-# ---------------------------------
-
-def load_api_keys():
-    sys_keys, sub_keys = [], []
-
-    i = 1
-    while True:
-        k = os.getenv(f'SYS_{i}')
-        if not k:
-            break
-        sys_keys.append(k)
-        i += 1
-
-    i = 1
-    while True:
-        k = os.getenv(f'SUB_{i}')
-        if not k:
-            break
-        sub_keys.append(k)
-        i += 1
-
-    if not sub_keys:
-        i = 1
-        while True:
-            k = os.getenv(f'API_{i}')
-            if not k:
-                break
-            sub_keys.append(k)
-            i += 1
-
-    if not sys_keys and sub_keys:
-        sys_keys = sub_keys[:1]
-
-    return sys_keys, sub_keys
-
-
-# ---------------------------------
-# AI 호출 (few-shot / history 지원) - 동기 함수만 사용
-# ---------------------------------
-
-def call_ai(prompt='테스트', system='지침', history=None, fine=None, api_key=None):
-    if api_key is None:
-        return ''
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system)
-
-    if fine:
-        ex = ''.join([f"user: {q}\nassistant: {a}\n" for q, a in fine])
-        combined = f"{ex}user: {prompt}"
-    else:
-        his = history_str(history if history is not None else [])
-        combined = f"{his}user: {prompt}"
-
-    resp = model.start_chat(history=[]).send_message(combined)
-    txt = resp._result.candidates[0].content.parts[0].text.strip()
-    return txt[9:].strip() if txt.lower().startswith('assistant:') else txt
-
-
-def call_ai_with_memory(prompt, system, mem_file, api_key, memory_limit=10):
-    history = last_n_history(mem_file, memory_limit)
-    save_memory({'role': 'user', 'content': prompt}, mem_file)
-    reply = call_ai(prompt, system, history=history, fine=None, api_key=api_key)
-    save_memory({'role': 'assistant', 'content': reply}, mem_file)
-    return reply
-
-
-# ---------------------------------
-# SYS/SUB 시스템 메시지 & few-shot
-# ---------------------------------
-
-SYS_SYSTEM = '''
-당신은 페르소나 '집도'용 SYS AI입니다.
-반드시 **쉼표(,)로만 구분된 키워드 나열 한 줄**로 출력하십시오.
-출력 예시는 "키워드1, 키워드2, 키워드3" 형태입니다. 다른 설명/문장/코드는 절대 금지합니다.
-
-입력으로 제공되는 [소그룹 특징], [공동 요소], [다양성 설명], [페르소나 수]를 바탕으로
-"페르소나 수 * 4" 개수만큼 서로 중복되지 않도록, 서로 다른 특성을 반영하는 키워드를 생성하십시오.
-키워드는 간결하되 의미가 분명해야 합니다.
-'''
-
-SYS_FINE = [
-    [
-        """[소그룹 특징] 한국 중산층 20~40대 직장인
-[공동 요소] 대한민국 거주
-[다양성 설명] 직업이 다양하다. 가족 구성이 다양하고 여가 활동도 다양하다.
-[페르소나 수] 3""",
-        "공기업_사무직, 프리랜서_디자이너, 중소기업_기획, 1인가구, 유자녀_맞벌이, 반려동물, 독서모임, 주말_등산, 가치소비, 저축_우선, 주식_초보, 부업_관심"
-    ],
-    [
-        """[소그룹 특징] 미국 대학 STEM 전공생
-[공동 요소] 기숙사 생활
-[다양성 설명] 국적이 다양하고 장학금도 다양하다. 국적/장학금/연구스타일/동아리활동이 다양하다.
-[페르소나 수] 2""",
-        "국제학생, 장학금_전액, 랩미팅_주도, 해커톤_참여, 오픈소스_기여, 장비_매니아, 창업동아리, 튜터링"
-    ],
-]
-
-SUB_SYSTEM = '''
-당신은 페르소나 생성 전용 SUB AI입니다.
-반드시 아래 4개 키만을 가지는 **순수 JSON 배열**로만 출력하십시오. 다른 텍스트, 주석, 설명은 금지합니다.
-이름은 영문, 공백/특수문자 없이 생성하십시오.
-
-필수 키:
-1. "name": (영문, 공백·특수문자 금지)
-2. "mind": 가치관·신념 (한 문단, 구체적으로)
-3. "action": 행동 패턴·습관 (길고 구체적으로)
-4. "character": 출생 배경·가족·교육·직업·중요 경험 (시간 순, 매우 구체적으로)
-
-출력 예시:
-[
-  {"name":"","mind":"","action":"","character":""}
-]
-'''
+# config.py에서 유틸/상수/함수 import
+from config import (
+    _strip_code_fence,
+    extract_json_array,
+    load_api_keys,
+    call_ai,
+    call_ai_with_memory,
+    SYS_SYSTEM,
+    SYS_FINE,
+    SUB_SYSTEM,
+    SYS1_DIALOG_SYSTEM,
+    SYS2_SUMMARIZER_SYSTEM
+)
 
 # ---------------------------------
 # SYS 키워드 생성 (소그룹 단위)
@@ -341,7 +167,7 @@ def build_vote_prompt(user_q):
         f"{user_q}\n\n"
         "출력 형식(정확히 두 줄):\n"
         "1) 한 문장 이유\n"
-        "2) 숫자(1~5) 한 글자만 (1=매우 긍정 ~ 5=매우 부정)"
+        "2) 숫자(1~5) 한 글자만 (1=매우 긍정/찬성 ~ 5=매우 부정/반대)"
     )
 
 
@@ -435,7 +261,194 @@ def save_vote_outputs(group_dir, qtext, results):
 
 
 # ---------------------------------
-# 플로우 (집단 생성 / 질문) - 동기 함수들
+# [NEW] 기존 집단 수정 플로우 (소그룹 추가/삭제)
+# ---------------------------------
+
+def modify_group_flow():
+    """NEW: 기존 페르소나 집단에 소그룹을 추가하거나 삭제합니다.
+    - 삭제 시 PERSONA.json의 해당 소그룹 소속 페르소나와 각 MEMORY/*.json을 모두 제거합니다.
+    - 추가 시 기존 생성 로직과 동일하게 키워드 생성 → 페르소나 생성 → PERSONA.json 갱신을 수행합니다.
+    """
+    sys_keys, sub_keys = load_api_keys()
+    if not sub_keys:
+        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
+        return
+
+    group_name = input("수정할 페르소나 집단 이름: ").strip()
+    group_dir = os.path.join('.', sanitize_folder(group_name))
+    os.makedirs(group_dir, exist_ok=True)
+
+    persona_path = os.path.join(group_dir, 'PERSONA.json')
+    personas = load_json(persona_path)
+
+    while True:
+        sel = input("1) 소그룹 추가  2) 소그룹 삭제  (엔터=종료): ").strip()
+        if sel == '1':
+            # 추가 입력 받기 (기존 생성 폼과 동일)
+            name = input("소그룹 이름: ").strip()
+            info = input("소그룹 정보(예: 중산층에 해당하는 인물들이며 ~): ").strip()
+            common = input("소그룹의 필수 공동 요소: ").strip()
+            count = int(input("소그룹의 페르소나 수: ").strip())
+            diversity = input("소그룹의 다양성(서술형): ").strip()
+            subgroup = {
+                'name': name,
+                'info': info,
+                'common': common,
+                'count': count,
+                'diversity': diversity,
+            }
+            sys_key = (sys_keys[len(personas) % len(sys_keys)]) if sys_keys else sub_keys[0]
+            kws = sys_generate_keywords(sys_key, subgroup)
+
+            name_counts = {}
+            # 기존 이름 카운트 복원
+            for p in personas:
+                base = p['name'].rsplit('_', 1)[0]
+                n = int(p['name'].rsplit('_', 1)[1]) if '_' in p['name'] else 0
+                name_counts[base] = max(name_counts.get(base, 0), n)
+
+            new_ps = create_personas_for_subgroup(subgroup, kws, sub_keys, name_counts, group_dir)
+            personas.extend(new_ps)
+            save_json(persona_path, personas)
+            print(f"[추가 완료] '{name}' 소그룹에서 {len(new_ps)}명 생성 및 저장")
+
+        elif sel == '2':
+            target = input("삭제할 소그룹 이름(여러 개는 콤마 구분): ").strip()
+            if not target:
+                continue
+            targets = {t.strip() for t in target.split(',') if t.strip()}
+            keep = []
+            removed = []
+            for p in personas:
+                if p.get('subgroup') in targets:
+                    # MEMORY 파일 삭제 시도
+                    mem_path = p.get('file')
+                    if mem_path and os.path.isfile(mem_path):
+                        try:
+                            os.remove(mem_path)
+                        except Exception:
+                            pass
+                    removed.append(p)
+                else:
+                    keep.append(p)
+            personas = keep
+            save_json(persona_path, personas)
+            # 빈 MEMORY 폴더 정리
+            mem_dir = os.path.join(group_dir, 'MEMORY')
+            try:
+                if os.path.isdir(mem_dir) and not os.listdir(mem_dir):
+                    shutil.rmtree(mem_dir)
+            except Exception:
+                pass
+            print(f"[삭제 완료] 소그룹 {sorted(list(targets))} 에 속한 {len(removed)}명 삭제")
+
+        elif sel == '':
+            break
+        else:
+            print('잘못된 입력입니다.')
+
+
+# ---------------------------------
+# [NEW] SYS_1 대화 모드 → SYS_2 요약 → 자동 소그룹 생성
+# ---------------------------------
+
+def auto_generate_group_flow():
+    """NEW: 4) 자동 생성 플로우
+    - SYS_1과 사용자 대화(quit 입력까지). 대화 로그를 group_dir/AUTO/dialog.jsonl로 저장.
+    - SYS_2가 로그를 읽어 소그룹 설계 JSON을 산출.
+    - 산출 결과를 그대로 사용해 소그룹별 키워드 생성 및 페르소나 생성 자동 실행.
+    """
+    sys_keys, sub_keys = load_api_keys()
+    if not sub_keys:
+        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
+        return
+
+    if not sys_keys:
+        print("SYS 키(SYS_1, SYS_2)가 필요합니다. .env에 SYS_1, SYS_2를 등록하세요.")
+        return
+
+    sys1_key = sys_keys[0]
+    sys2_key = sys_keys[1] if len(sys_keys) >= 2 else sys_keys[0]
+
+    group_name = input("자동 생성할 페르소나 집단 이름: ").strip()
+    group_dir = os.path.join('.', sanitize_folder(group_name))
+    os.makedirs(group_dir, exist_ok=True)
+
+    auto_dir = os.path.join(group_dir, 'AUTO')
+    os.makedirs(auto_dir, exist_ok=True)
+    dialog_path = os.path.join(auto_dir, 'dialog.jsonl')
+
+    # --- SYS_1 대화 모드 ---
+    print("[SYS_1 대화 모드 시작] 필요 정보를 말씀해 주세요. (종료: quit)")
+    genai.configure(api_key=sys1_key)
+    model1 = genai.GenerativeModel(GEMINI_MODEL, system_instruction=SYS1_DIALOG_SYSTEM)
+    chat1 = model1.start_chat(history=[])
+
+    dialog = []
+    # 첫 안내 메시지 생성
+    first = chat1.send_message("사용자 요구 파악을 위한 첫 질문을 해주세요.")
+    first_txt = first._result.candidates[0].content.parts[0].text.strip()
+    print(f"SYS_1: {first_txt}")
+    dialog.append({'role': 'assistant', 'content': first_txt})
+
+    while True:
+        user_in = input("YOU: ")
+        if user_in.strip().lower() == 'quit':
+            break
+        dialog.append({'role': 'user', 'content': user_in})
+        resp = chat1.send_message(user_in)
+        txt = resp._result.candidates[0].content.parts[0].text.strip()
+        print(f"SYS_1: {txt}")
+        dialog.append({'role': 'assistant', 'content': txt})
+
+    # 대화 로그 저장
+    with open(dialog_path, 'w', encoding='utf-8') as f:
+        for turn in dialog:
+            f.write(json.dumps(turn, ensure_ascii=False) + "\n")
+    print(f"[저장] 대화 로그 → {dialog_path}")
+
+    # --- SYS_2 요약/설계 산출 ---
+    transcript = history_str(dialog)
+    print("[SYS_2] 대화 내용을 바탕으로 소그룹 설계를 생성합니다...")
+    summary_txt = call_ai(transcript, SYS2_SUMMARIZER_SYSTEM, api_key=sys2_key)
+    try:
+        subgroups = extract_json_array(summary_txt)
+    except Exception:
+        print("[경고] SYS_2 출력 파싱 실패. 빈 소그룹 목록으로 진행합니다.")
+        subgroups = []
+
+    # --- 생성 실행 ---
+    persona_path = os.path.join(group_dir, 'PERSONA.json')
+    personas = load_json(persona_path)
+    name_counts = {}
+    for p in personas:
+        base = p['name'].rsplit('_', 1)[0]
+        n = int(p['name'].rsplit('_', 1)[1]) if '_' in p['name'] else 0
+        name_counts[base] = max(name_counts.get(base, 0), n)
+
+    for idx, sg in enumerate(subgroups):
+        # 형식 정규화 및 기본값 보정
+        subgroup = {
+            'name': str(sg.get('name', f'Subgroup_{idx+1}')),
+            'info': str(sg.get('info', '')),
+            'common': str(sg.get('common', '')),
+            'count': int(sg.get('count', 0) or 0),
+            'diversity': str(sg.get('diversity', '')),
+        }
+        if subgroup['count'] <= 0:
+            print(f"[스킵] '{subgroup['name']}' count가 0이어서 건너뜁니다.")
+            continue
+        sys_key = (sys_keys[idx % len(sys_keys)]) if sys_keys else sub_keys[0]
+        kws = sys_generate_keywords(sys_key, subgroup)
+        new_ps = create_personas_for_subgroup(subgroup, kws, sub_keys, name_counts, group_dir)
+        personas.extend(new_ps)
+
+    save_json(persona_path, personas)
+    print(f"[완료] 자동 생성 종료. 현재 총 페르소나 수: {len(personas)}명")
+
+
+# ---------------------------------
+# 플로우 (집단 생성 / 질문 / 수정 / 자동생성) - 동기 함수들
 # ---------------------------------
 
 def ask_flow():
@@ -477,11 +490,19 @@ def create_group_flow():
         print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
         return
 
-    mode = input("1) 페르소나 집단 제작  2) 질문하기  [1/2]: ").strip()
+    # NEW: 메뉴 확장
+    mode = input("1) 페르소나 집단 제작  2) 질문하기  3) 기존 집단 수정  4) 집단 자동 생성  [1/2/3/4]: ").strip()
     if mode == '2':
         ask_flow()
         return
+    if mode == '3':  # NEW
+        modify_group_flow()
+        return
+    if mode == '4':  # NEW
+        auto_generate_group_flow()
+        return
 
+    # (기존) 1) 집단 제작
     group_name = input("페르소나 집단의 이름: ").strip()
     group_dir = os.path.join('.', sanitize_folder(group_name))
     os.makedirs(group_dir, exist_ok=True)
@@ -526,4 +547,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

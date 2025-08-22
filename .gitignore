@@ -1,5 +1,14 @@
 .env
 .json
+.md
 .gemini
-./*.json
-./*/*.json
+
+**/RESULTS/**/*.json
+**/RESULTS/**/*.md
+
+!README.md
+
+#모든 폴더는 무시하고 싶다.
+./고등학생
+./사회
+./재산
