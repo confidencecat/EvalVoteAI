@@ -6,8 +6,8 @@ import os
 import json
 import re
 import random
-import asyncio
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -46,7 +46,6 @@ def _set_korean_font():
 
 
 _set_korean_font()
-
 
 def load_json(path):
     if os.path.exists(path):
@@ -152,9 +151,8 @@ def load_api_keys():
 
 
 # ---------------------------------
-# AI 호출 (few-shot / history 지원)
+# AI 호출 (few-shot / history 지원) - 동기 함수만 사용
 # ---------------------------------
-import google.generativeai as genai
 
 def call_ai(prompt='테스트', system='지침', history=None, fine=None, api_key=None):
     if api_key is None:
@@ -174,23 +172,10 @@ def call_ai(prompt='테스트', system='지침', history=None, fine=None, api_ke
     return txt[9:].strip() if txt.lower().startswith('assistant:') else txt
 
 
-async def aio_call_ai(prompt, system, *, history=None, fine=None, api_key=None):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: call_ai(prompt, system, history, fine, api_key))
-
-
 def call_ai_with_memory(prompt, system, mem_file, api_key, memory_limit=10):
     history = last_n_history(mem_file, memory_limit)
     save_memory({'role': 'user', 'content': prompt}, mem_file)
     reply = call_ai(prompt, system, history=history, fine=None, api_key=api_key)
-    save_memory({'role': 'assistant', 'content': reply}, mem_file)
-    return reply
-
-
-async def aio_call_ai_with_memory(prompt, system, mem_file, api_key, memory_limit=10):
-    history = last_n_history(mem_file, memory_limit)
-    save_memory({'role': 'user', 'content': prompt}, mem_file)
-    reply = await aio_call_ai(prompt, system, history=history, fine=None, api_key=api_key)
     save_memory({'role': 'assistant', 'content': reply}, mem_file)
     return reply
 
@@ -213,14 +198,14 @@ SYS_FINE = [
     [
         """[소그룹 특징] 한국 중산층 20~40대 직장인
 [공동 요소] 대한민국 거주
-[다양성 설명] 재정/직업/가족구성/여가활동에서 분화
+[다양성 설명] 직업이 다양하다. 가족 구성이 다양하고 여가 활동도 다양하다.
 [페르소나 수] 3""",
         "공기업_사무직, 프리랜서_디자이너, 중소기업_기획, 1인가구, 유자녀_맞벌이, 반려동물, 독서모임, 주말_등산, 가치소비, 저축_우선, 주식_초보, 부업_관심"
     ],
     [
         """[소그룹 특징] 미국 대학 STEM 전공생
 [공동 요소] 기숙사 생활
-[다양성 설명] 국적/장학금/연구스타일/동아리활동 다양
+[다양성 설명] 국적이 다양하고 장학금도 다양하다. 국적/장학금/연구스타일/동아리활동이 다양하다.
 [페르소나 수] 2""",
         "국제학생, 장학금_전액, 랩미팅_주도, 해커톤_참여, 오픈소스_기여, 장비_매니아, 창업동아리, 튜터링"
     ],
@@ -243,12 +228,11 @@ SUB_SYSTEM = '''
 ]
 '''
 
-
 # ---------------------------------
 # SYS 키워드 생성 (소그룹 단위)
 # ---------------------------------
 
-async def sys_generate_keywords(sys_key, subgroup):
+def sys_generate_keywords(sys_key, subgroup):
     target = subgroup['count'] * 4
     prompt = (
         f"[소그룹 특징] {subgroup['info']}\n"
@@ -258,7 +242,7 @@ async def sys_generate_keywords(sys_key, subgroup):
         f"요구 개수: {target}\n"
         f"지시: 쉼표로만 구분된 키워드를 정확히 {target}개 생성"
     )
-    txt = await aio_call_ai(prompt, SYS_SYSTEM, fine=SYS_FINE, api_key=sys_key)
+    txt = call_ai(prompt, SYS_SYSTEM, fine=SYS_FINE, api_key=sys_key)
 
     kws_raw = [w.strip() for w in txt.split(',') if w.strip()]
     seen, uniq = set(), []
@@ -278,7 +262,7 @@ async def sys_generate_keywords(sys_key, subgroup):
 
 
 # ---------------------------------
-# SUB 페르소나 생성
+# SUB 페르소나 생성 (동기 함수) + ThreadPoolExecutor로 동시 처리
 # ---------------------------------
 
 def build_sub_prompt(subgroup, pick3):
@@ -292,8 +276,8 @@ def build_sub_prompt(subgroup, pick3):
     )
 
 
-async def create_one_persona(subgroup, pick3, sub_key, name_counts, group_dir):
-    txt = await aio_call_ai(build_sub_prompt(subgroup, pick3), SUB_SYSTEM, api_key=sub_key)
+def create_one_persona(subgroup, pick3, sub_key, name_counts, group_dir):
+    txt = call_ai(build_sub_prompt(subgroup, pick3), SUB_SYSTEM, api_key=sub_key)
     try:
         data = extract_json_array(txt)
         p = data[0]
@@ -327,27 +311,29 @@ async def create_one_persona(subgroup, pick3, sub_key, name_counts, group_dir):
     return p
 
 
-async def create_personas_for_subgroup(subgroup, keywords, sub_keys, name_counts, group_dir):
+def create_personas_for_subgroup(subgroup, keywords, sub_keys, name_counts, group_dir):
     total = subgroup['count']
     all_p = []
     K = max(1, len(sub_keys))
 
+    # SUB API 수만큼 동시 실행 → 배치 반복 (ThreadPoolExecutor)
     for start in range(0, total, K):
-        batch = []
         end = min(start + K, total)
-        for i in range(start, end):
-            pick3 = random.sample(keywords, 3) if len(keywords) >= 3 else keywords[:]
-            key = sub_keys[(i - start) % K]
-            batch.append(asyncio.create_task(create_one_persona(subgroup, pick3, key, name_counts, group_dir)))
-        res = await asyncio.gather(*batch)
-        all_p.extend(res)
+        with ThreadPoolExecutor(max_workers=K) as ex:
+            futures = []
+            for i in range(start, end):
+                pick3 = random.sample(keywords, 3) if len(keywords) >= 3 else keywords[:]
+                key = sub_keys[(i - start) % K]
+                futures.append(ex.submit(create_one_persona, subgroup, pick3, key, name_counts, group_dir))
+            for fut in as_completed(futures):
+                all_p.append(fut.result())
 
     print(f"<[ {subgroup['name']} ]  제작 완료>")
     return all_p
 
 
 # ---------------------------------
-# 질문/응답 (비동기, 이유 → 숫자)
+# 질문/응답 (이유 → 숫자) - ThreadPoolExecutor로 동시 처리
 # ---------------------------------
 
 def build_vote_prompt(user_q):
@@ -359,26 +345,32 @@ def build_vote_prompt(user_q):
     )
 
 
-async def ask_one_persona(p, sub_key, qtext):
-    reply = await aio_call_ai_with_memory(build_vote_prompt(qtext), p['system'], p['file'], sub_key, memory_limit=10)
+def ask_one_persona(p, sub_key, qtext):
+    reply = call_ai_with_memory(build_vote_prompt(qtext), p['system'], p['file'], sub_key, memory_limit=10)
     parts = reply.strip().split('\n', 1)
     reason = parts[0].strip() if parts else ''
     num = parts[1].strip() if len(parts) > 1 else ''
     return {'name': p['name'], 'reason': reason, 'number': num}
 
 
-async def ask_many(personas, sub_keys, qtext):
+def ask_many(personas, sub_keys, qtext):
     K = max(1, len(sub_keys))
     out = []
     for start in range(0, len(personas), K):
-        tasks = []
         end = min(start + K, len(personas))
-        for i in range(start, end):
-            key = sub_keys[(i - start) % K]
-            tasks.append(asyncio.create_task(ask_one_persona(personas[i], key, qtext)))
-        out.extend(await asyncio.gather(*tasks))
+        with ThreadPoolExecutor(max_workers=K) as ex:
+            futures = []
+            for i in range(start, end):
+                key = sub_keys[(i - start) % K]
+                futures.append(ex.submit(ask_one_persona, personas[i], key, qtext))
+            for fut in as_completed(futures):
+                out.append(fut.result())
     return out
 
+
+# ---------------------------------
+# 결과 저장 (JSON/MD/PNG)
+# ---------------------------------
 
 def save_vote_outputs(group_dir, qtext, results):
     qslug = sanitize_folder(qtext, max_len=80)
@@ -443,10 +435,10 @@ def save_vote_outputs(group_dir, qtext, results):
 
 
 # ---------------------------------
-# 플로우 (집단 생성 / 질문)
+# 플로우 (집단 생성 / 질문) - 동기 함수들
 # ---------------------------------
 
-async def ask_flow():
+def ask_flow():
     _, sub_keys = load_api_keys()
     if not sub_keys:
         print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
@@ -466,7 +458,7 @@ async def ask_flow():
         n = int(input("질문 수: ").strip())
         qs = [input(f"{i+1}번째 질문: ").strip() for i in range(n)]
         for q in qs:
-            res = await ask_many(personas, sub_keys, q)
+            res = ask_many(personas, sub_keys, q)
             save_vote_outputs(group_dir, q, res)
         print("-시스템 종료-")
     else:
@@ -474,12 +466,12 @@ async def ask_flow():
             q = input("> ").strip()
             if q.lower() == 'exit':
                 return
-            res = await ask_many(personas, sub_keys, q)
+            res = ask_many(personas, sub_keys, q)
             save_vote_outputs(group_dir, q, res)
             print("-응답 저장 완료-")
 
 
-async def create_group_flow():
+def create_group_flow():
     sys_keys, sub_keys = load_api_keys()
     if not sub_keys:
         print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
@@ -487,7 +479,7 @@ async def create_group_flow():
 
     mode = input("1) 페르소나 집단 제작  2) 질문하기  [1/2]: ").strip()
     if mode == '2':
-        await ask_flow()
+        ask_flow()
         return
 
     group_name = input("페르소나 집단의 이름: ").strip()
@@ -514,13 +506,11 @@ async def create_group_flow():
     all_personas = []
     name_counts = {}
 
+    # 소그룹은 순차 처리, 각 소그룹 내부는 ThreadPoolExecutor로 동시 생성
     for idx, sg in enumerate(subgroups):
-        if sys_keys:
-            sys_key = sys_keys[idx % len(sys_keys)]
-        else:
-            sys_key = sub_keys[0]
-        kws = await sys_generate_keywords(sys_key, sg)
-        personas = await create_personas_for_subgroup(sg, kws, sub_keys, name_counts, group_dir)
+        sys_key = (sys_keys[idx % len(sys_keys)]) if sys_keys else sub_keys[0]
+        kws = sys_generate_keywords(sys_key, sg)
+        personas = create_personas_for_subgroup(sg, kws, sub_keys, name_counts, group_dir)
         all_personas.extend(personas)
 
     save_json(os.path.join(group_dir, 'PERSONA.json'), all_personas)
@@ -528,12 +518,12 @@ async def create_group_flow():
 
 
 # ---------------------------------
-# 엔트리포인트
+# 엔트리포인트 (동기)
 # ---------------------------------
 
-async def main():
-    await create_group_flow()
-
+def main():
+    create_group_flow()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
+
