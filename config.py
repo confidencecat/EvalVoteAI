@@ -1,13 +1,21 @@
-# 코드 블록/JSON 추출 유틸
+import os
+import json
+import re
+from matplotlib import font_manager, rcParams
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+load_dotenv()
+
+GEMINI_MODEL = 'gemini-2.5-flash'
+
 def _strip_code_fence(s: str) -> str:
-    import re
     s = s.strip()
     s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\s*```\s*$', '', s)
     return s.strip()
 
 def extract_json_array(text: str):
-    import json
     if not text or not text.strip():
         raise ValueError('empty')
     text = _strip_code_fence(text)
@@ -23,9 +31,7 @@ def extract_json_array(text: str):
         return json.loads(candidate)
     raise ValueError('no json found')
 
-# API 키 자동 로딩
 def load_api_keys():
-    import os
     sys_keys, sub_keys = [], []
     i = 1
     while True:
@@ -53,10 +59,7 @@ def load_api_keys():
         sys_keys = sub_keys[:1]
     return sys_keys, sub_keys
 
-# AI 호출 함수
 def call_ai(prompt='테스트', system='지침', history=None, fine=None, api_key=None):
-    import google.generativeai as genai
-    from config import GEMINI_MODEL, history_str
     if api_key is None:
         return ''
     genai.configure(api_key=api_key)
@@ -72,13 +75,12 @@ def call_ai(prompt='테스트', system='지침', history=None, fine=None, api_ke
     return txt[9:].strip() if txt.lower().startswith('assistant:') else txt
 
 def call_ai_with_memory(prompt, system, mem_file, api_key, memory_limit=10):
-    from config import last_n_history, save_memory, call_ai
     history = last_n_history(mem_file, memory_limit)
     save_memory({'role': 'user', 'content': prompt}, mem_file)
     reply = call_ai(prompt, system, history=history, fine=None, api_key=api_key)
     save_memory({'role': 'assistant', 'content': reply}, mem_file)
     return reply
-# 메모리 관리 함수
+
 def save_memory(entry, memory_file):
     mem = load_json(memory_file)
     mem.append(entry)
@@ -94,7 +96,6 @@ def last_n_history(memory_file, n=10):
     mem = load_json(memory_file)
     return mem[-n:] if mem else []
 
-# 시스템 메시지/프롬프트
 SYS_SYSTEM = '''
 당신은 페르소나 '집도'용 SYS AI입니다.
 반드시 **쉼표(,)로만 구분된 키워드 나열 한 줄**로 출력하십시오.
@@ -164,7 +165,6 @@ SYS2_SUMMARIZER_SYSTEM = '''
 다른 텍스트나 주석 없이 JSON 배열만 출력하세요.
 '''
 
-# 프롬프트 빌더 함수
 def build_sub_prompt(subgroup, pick3):
     return (
         "아래 정보를 바탕으로 1명의 페르소나를 생성하십시오.\n"
@@ -182,28 +182,13 @@ def build_vote_prompt(user_q):
         "1) 한 문장 이유\n"
         "2) 숫자(1~5) 한 글자만 (1=매우 긍정 ~ 5=매우 부정)"
     )
-# config.py
-# 공통 상수, 설정, 유틸 함수 등을 이 파일에서 관리합니다.
 
-import os
-import json
-import re
-from matplotlib import font_manager, rcParams
-from dotenv import load_dotenv
-
-# 환경 변수 로드
-load_dotenv()
-
-# 모델명
-GEMINI_MODEL = 'gemini-2.0-flash'
-
-# 한글 폰트 설정 함수
 def set_korean_font():
     try:
         candidates = [
-            'Malgun Gothic',        # Windows
-            'AppleGothic',          # macOS
-            'NanumGothic',          # Linux/Windows/macOS
+            'Malgun Gothic', # Windows
+            'AppleGothic', # macOS
+            'NanumGothic', # Linux/Windows/macOS
             'Noto Sans CJK KR',
             'Noto Sans KR',
             'Batang', 'Gulim'
@@ -220,7 +205,6 @@ def set_korean_font():
         rcParams['font.family'] = ['DejaVu Sans']
         rcParams['axes.unicode_minus'] = False
 
-# JSON 로드/저장 함수
 def load_json(path):
     if os.path.exists(path):
         with open(path, 'r', encoding='utf-8') as f:
@@ -234,36 +218,6 @@ def save_json(path, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# API 키 자동 로딩 함수
-def load_api_keys():
-    sys_keys, sub_keys = [], []
-    i = 1
-    while True:
-        k = os.getenv(f'SYS_{i}')
-        if not k:
-            break
-        sys_keys.append(k)
-        i += 1
-    i = 1
-    while True:
-        k = os.getenv(f'SUB_{i}')
-        if not k:
-            break
-        sub_keys.append(k)
-        i += 1
-    if not sub_keys:
-        i = 1
-        while True:
-            k = os.getenv(f'API_{i}')
-            if not k:
-                break
-            sub_keys.append(k)
-            i += 1
-    if not sys_keys and sub_keys:
-        sys_keys = sub_keys[:1]
-    return sys_keys, sub_keys
-
-# 폴더명 정제 함수
 def sanitize_folder(name, max_len=60):
     s = re.sub(r'[^\w\s-]', '', name).strip()
     s = re.sub(r'\s+', '_', s)

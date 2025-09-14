@@ -17,12 +17,7 @@ from config import (
     load_json,
     save_json,
     load_api_keys,
-    sanitize_folder
-)
-
-
-# 메모리 관리, 시스템 메시지, 프롬프트 등 config.py에서 import
-from config import (
+    sanitize_folder,
     save_memory,
     history_str,
     last_n_history,
@@ -32,34 +27,21 @@ from config import (
     SYS1_DIALOG_SYSTEM,
     SYS2_SUMMARIZER_SYSTEM,
     build_sub_prompt,
-    build_vote_prompt
-)
-# 한글 폰트 설정
-set_korean_font()
-
-
-
-
-# config.py에서 유틸/상수/함수 import
-from config import (
+    build_vote_prompt,
     _strip_code_fence,
     extract_json_array,
-    load_api_keys,
     call_ai,
-    call_ai_with_memory,
-    SYS_SYSTEM,
-    SYS_FINE,
-    SUB_SYSTEM,
-    SYS1_DIALOG_SYSTEM,
-    SYS2_SUMMARIZER_SYSTEM
+    call_ai_with_memory
 )
 
-# ---------------------------------
-# SYS 키워드 생성 (소그룹 단위)
-# ---------------------------------
+set_korean_font()
+
+keyword_num = 4
+keyword_choices_num = 3
 
 def sys_generate_keywords(sys_key, subgroup):
-    target = subgroup['count'] * 4
+    global keyword_num
+    target = subgroup['count'] * keyword_num
     prompt = (
         f"[소그룹 특징] {subgroup['info']}\n"
         f"[공동 요소] {subgroup['common']}\n"
@@ -87,23 +69,8 @@ def sys_generate_keywords(sys_key, subgroup):
     return kws[:target]
 
 
-# ---------------------------------
-# SUB 페르소나 생성 (동기 함수) + ThreadPoolExecutor로 동시 처리
-# ---------------------------------
-
-def build_sub_prompt(subgroup, pick3):
-    return (
-        "아래 정보를 바탕으로 1명의 페르소나를 생성하십시오.\n"
-        f"[소그룹 특징] {subgroup['info']}\n"
-        f"[공동 요소] {subgroup['common']}\n"
-        f"[다양성 설명] {subgroup['diversity']}\n"
-        f"[핵심 키워드 3개] {', '.join(pick3)}\n"
-        "반드시 지정된 JSON 배열 형식으로만 출력하십시오."
-    )
-
-
-def create_one_persona(subgroup, pick3, sub_key, name_counts, group_dir):
-    txt = call_ai(build_sub_prompt(subgroup, pick3), SUB_SYSTEM, api_key=sub_key)
+def create_one_persona(subgroup, pick_num, sub_key, name_counts, group_dir):
+    txt = call_ai(build_sub_prompt(subgroup, pick_num), SUB_SYSTEM, api_key=sub_key)
     try:
         data = extract_json_array(txt)
         p = data[0]
@@ -124,9 +91,13 @@ def create_one_persona(subgroup, pick3, sub_key, name_counts, group_dir):
     os.makedirs(mem_dir, exist_ok=True)
     mem_path = os.path.join(mem_dir, f"{idx}.json")
 
+    # 메모리 파일이 없으면 빈 배열로 초기화
+    if not os.path.exists(mem_path):
+        save_json(mem_path, [])
+
     p['name'] = idx
     p['file'] = mem_path
-    p['keywords'] = pick3
+    p['keywords'] = pick_num
     p['subgroup'] = subgroup['name']
     p['system'] = (
         f"너는 아래 정보를 따르는 페르소나이다.\n"
@@ -138,37 +109,24 @@ def create_one_persona(subgroup, pick3, sub_key, name_counts, group_dir):
 
 
 def create_personas_for_subgroup(subgroup, keywords, sub_keys, name_counts, group_dir):
+    global keyword_choices_num
     total = subgroup['count']
     all_p = []
     K = max(1, len(sub_keys))
 
-    # SUB API 수만큼 동시 실행 → 배치 반복 (ThreadPoolExecutor)
     for start in range(0, total, K):
         end = min(start + K, total)
         with ThreadPoolExecutor(max_workers=K) as ex:
             futures = []
             for i in range(start, end):
-                pick3 = random.sample(keywords, 3) if len(keywords) >= 3 else keywords[:]
+                pick_num = random.sample(keywords, keyword_choices_num) if keyword_choices_num >= 3 else keywords[:]
                 key = sub_keys[(i - start) % K]
-                futures.append(ex.submit(create_one_persona, subgroup, pick3, key, name_counts, group_dir))
+                futures.append(ex.submit(create_one_persona, subgroup, pick_num, key, name_counts, group_dir))
             for fut in as_completed(futures):
                 all_p.append(fut.result())
 
     print(f"<[ {subgroup['name']} ]  제작 완료>")
     return all_p
-
-
-# ---------------------------------
-# 질문/응답 (이유 → 숫자) - ThreadPoolExecutor로 동시 처리
-# ---------------------------------
-
-def build_vote_prompt(user_q):
-    return (
-        f"{user_q}\n\n"
-        "출력 형식(정확히 두 줄):\n"
-        "1) 한 문장 이유\n"
-        "2) 숫자(1~5) 한 글자만 (1=매우 긍정/찬성 ~ 5=매우 부정/반대)"
-    )
 
 
 def ask_one_persona(p, sub_key, qtext):
