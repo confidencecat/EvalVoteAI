@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import google.generativeai as genai
 import matplotlib.pyplot as plt
 
-# config.py에서 공통 설정/함수 import
 from config import (
     GEMINI_MODEL,
     set_korean_font,
@@ -91,7 +90,6 @@ def create_one_persona(subgroup, pick_num, sub_key, name_counts, group_dir):
     os.makedirs(mem_dir, exist_ok=True)
     mem_path = os.path.join(mem_dir, f"{idx}.json")
 
-    # 메모리 파일이 없으면 빈 배열로 초기화
     if not os.path.exists(mem_path):
         save_json(mem_path, [])
 
@@ -152,19 +150,14 @@ def ask_many(personas, sub_keys, qtext):
     return out
 
 
-# ---------------------------------
-# 결과 저장 (JSON/MD/PNG)
-# ---------------------------------
 
 def save_vote_outputs(group_dir, qtext, results):
     qslug = sanitize_folder(qtext, max_len=80)
     res_dir = os.path.join(group_dir, 'RESULTS', qslug)
     os.makedirs(res_dir, exist_ok=True)
 
-    # JSON 저장
     save_json(os.path.join(res_dir, 'results.json'), results)
 
-    # Markdown & 그래프 저장
     md_path = os.path.join(res_dir, f"{qslug}.md")
     nums = []
     with open(md_path, 'w', encoding='utf-8') as f:
@@ -216,11 +209,6 @@ def save_vote_outputs(group_dir, qtext, results):
         print(f"'{qslug}'에 대한 그래프 저장 완료.")
     except Exception as e:
         print(f"그래프 생성 중 오류 발생: {e}")
-
-
-# ---------------------------------
-# [NEW] 기존 집단 수정 플로우 (소그룹 추가/삭제)
-# ---------------------------------
 
 def modify_group_flow():
     """NEW: 기존 페르소나 집단에 소그룹을 추가하거나 삭제합니다.
@@ -306,10 +294,6 @@ def modify_group_flow():
             print('잘못된 입력입니다.')
 
 
-# ---------------------------------
-# [NEW] SYS_1 대화 모드 → SYS_2 요약 → 자동 소그룹 생성
-# ---------------------------------
-
 def auto_generate_group_flow():
     """NEW: 4) 자동 생성 플로우
     - SYS_1과 사용자 대화(quit 입력까지). 대화 로그를 group_dir/AUTO/dialog.jsonl로 저장.
@@ -336,14 +320,12 @@ def auto_generate_group_flow():
     os.makedirs(auto_dir, exist_ok=True)
     dialog_path = os.path.join(auto_dir, 'dialog.jsonl')
 
-    # --- SYS_1 대화 모드 ---
     print("[SYS_1 대화 모드 시작] 필요 정보를 말씀해 주세요. (종료: quit)")
     genai.configure(api_key=sys1_key)
     model1 = genai.GenerativeModel(GEMINI_MODEL, system_instruction=SYS1_DIALOG_SYSTEM)
     chat1 = model1.start_chat(history=[])
 
     dialog = []
-    # 첫 안내 메시지 생성
     first = chat1.send_message("사용자 요구 파악을 위한 첫 질문을 해주세요.")
     first_txt = first._result.candidates[0].content.parts[0].text.strip()
     print(f"SYS_1: {first_txt}")
@@ -359,13 +341,11 @@ def auto_generate_group_flow():
         print(f"SYS_1: {txt}")
         dialog.append({'role': 'assistant', 'content': txt})
 
-    # 대화 로그 저장
     with open(dialog_path, 'w', encoding='utf-8') as f:
         for turn in dialog:
             f.write(json.dumps(turn, ensure_ascii=False) + "\n")
     print(f"[저장] 대화 로그 → {dialog_path}")
 
-    # --- SYS_2 요약/설계 산출 ---
     transcript = history_str(dialog)
     print("[SYS_2] 대화 내용을 바탕으로 소그룹 설계를 생성합니다...")
     summary_txt = call_ai(transcript, SYS2_SUMMARIZER_SYSTEM, api_key=sys2_key)
@@ -375,7 +355,6 @@ def auto_generate_group_flow():
         print("[경고] SYS_2 출력 파싱 실패. 빈 소그룹 목록으로 진행합니다.")
         subgroups = []
 
-    # --- 생성 실행 ---
     persona_path = os.path.join(group_dir, 'PERSONA.json')
     personas = load_json(persona_path)
     name_counts = {}
@@ -385,7 +364,6 @@ def auto_generate_group_flow():
         name_counts[base] = max(name_counts.get(base, 0), n)
 
     for idx, sg in enumerate(subgroups):
-        # 형식 정규화 및 기본값 보정
         subgroup = {
             'name': str(sg.get('name', f'Subgroup_{idx+1}')),
             'info': str(sg.get('info', '')),
@@ -403,11 +381,6 @@ def auto_generate_group_flow():
 
     save_json(persona_path, personas)
     print(f"[완료] 자동 생성 종료. 현재 총 페르소나 수: {len(personas)}명")
-
-
-# ---------------------------------
-# 플로우 (집단 생성 / 질문 / 수정 / 자동생성) - 동기 함수들
-# ---------------------------------
 
 def ask_flow():
     _, sub_keys = load_api_keys()
@@ -448,19 +421,17 @@ def create_group_flow():
         print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
         return
 
-    # NEW: 메뉴 확장
     mode = input("1) 페르소나 집단 제작  2) 질문하기  3) 기존 집단 수정  4) 집단 자동 생성  [1/2/3/4]: ").strip()
     if mode == '2':
         ask_flow()
         return
-    if mode == '3':  # NEW
+    if mode == '3':
         modify_group_flow()
         return
-    if mode == '4':  # NEW
+    if mode == '4':
         auto_generate_group_flow()
         return
 
-    # (기존) 1) 집단 제작
     group_name = input("페르소나 집단의 이름: ").strip()
     group_dir = os.path.join('.', sanitize_folder(group_name))
     os.makedirs(group_dir, exist_ok=True)
@@ -495,10 +466,6 @@ def create_group_flow():
     save_json(os.path.join(group_dir, 'PERSONA.json'), all_personas)
     print(f"\n[완료] 모든 소그룹 제작이 종료되었습니다. ({len(all_personas)}명)")
 
-
-# ---------------------------------
-# 엔트리포인트 (동기)
-# ---------------------------------
 
 def main():
     create_group_flow()
