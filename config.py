@@ -32,32 +32,25 @@ def extract_json_array(text: str):
     raise ValueError('no json found')
 
 def load_api_keys():
-    sys_keys, sub_keys = [], []
-    i = 1
-    while True:
-        k = os.getenv(f'SYS_{i}')
-        if not k:
-            break
-        sys_keys.append(k)
-        i += 1
-    i = 1
-    while True:
-        k = os.getenv(f'SUB_{i}')
-        if not k:
-            break
-        sub_keys.append(k)
-        i += 1
-    if not sub_keys:
-        i = 1
-        while True:
-            k = os.getenv(f'API_{i}')
-            if not k:
-                break
-            sub_keys.append(k)
-            i += 1
-    if not sys_keys and sub_keys:
-        sys_keys = sub_keys[:1]
-    return sys_keys, sub_keys
+    """SYS_KEY와 SUB_KEY 각각 하나씩만 로드합니다."""
+    sys_key = os.getenv('SYS_KEY')
+    sub_key = os.getenv('SUB_KEY')
+    
+    # 하위 호환성을 위해 기존 형식도 체크
+    if not sys_key:
+        sys_key = os.getenv('SYS_1')
+    if not sub_key:
+        sub_key = os.getenv('SUB_1')
+    
+    # SUB_KEY가 없으면 API_KEY로 대체
+    if not sub_key:
+        sub_key = os.getenv('API_KEY') or os.getenv('API_1')
+    
+    # SYS_KEY가 없으면 SUB_KEY를 사용
+    if not sys_key and sub_key:
+        sys_key = sub_key
+    
+    return sys_key, sub_key
 
 def call_ai(prompt='테스트', system='지침', history=None, fine=None, api_key=None):
     if api_key is None:
@@ -140,31 +133,6 @@ SUB_SYSTEM = '''
 ]
 '''
 
-SYS1_DIALOG_SYSTEM = '''
-당신은 "페르소나 집단 설계 컨설턴트(SYS_1)"입니다. 사용자의 도메인/목표/제약을 대화로 파악하고,
-소그룹 분할 기준, 필수 공동 요소, 다양성 축, 각 소그룹별 페르소나 수에 대해 질의응답을 통해 구체화합니다.
-- 친절히 질문하고, 중간 요약을 제공합니다.
-- 코드/JSON을 출력하지 말고 사람 친화적 문장으로만 답하세요.
-- 사용자가 'quit'을 입력할 때까지 대화를 이어갑니다.
-- 본 프로그램의 입력 규격(소그룹 이름, 소그룹 정보, 필수 공동 요소, 페르소나 수, 다양성)을 이해하고 질문을 설계합니다.
-'''
-
-SYS2_SUMMARIZER_SYSTEM = '''
-당신은 "소그룹 설계 요약기(SYS_2)"입니다. 사용자와 SYS_1의 대화 로그를 입력받아
-이 프로그램의 "소그룹 입력 폼"에 맞는 내용을 생성합니다. 반드시 **순수 JSON 배열**만 출력합니다.
-각 원소는 다음 키를 포함해야 합니다:
-- name: 소그룹 이름(간결)
-- info: 소그룹 정보(예: 특성, 맥락, 배경, 목표 등 한 문단)
-- common: 소그룹의 필수 공동 요소(한 문장)
-- count: 페르소나 수(양의 정수)
-- diversity: 다양성(서술형, 내부 차이의 축을 명확히)
-예시 형식:
-[
-  {"name":"","info":"","common":"","count":3,"diversity":""}
-]
-다른 텍스트나 주석 없이 JSON 배열만 출력하세요.
-'''
-
 def build_sub_prompt(subgroup, pick3):
     return (
         "아래 정보를 바탕으로 1명의 페르소나를 생성하십시오.\n"
@@ -215,8 +183,14 @@ def save_json(path, data):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    print(f"[DEBUG save_json] 파일 저장 중: {path}")
+    print(f"[DEBUG save_json] 데이터 타입: {type(data)}, 길이: {len(data) if isinstance(data, (list, dict)) else 'N/A'}")
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        print(f"[DEBUG save_json] 저장 완료: {path}")
+    except Exception as e:
+        print(f"[ERROR save_json] 저장 실패: {e}")
 
 def sanitize_folder(name, max_len=60):
     s = re.sub(r'[^\w\s-]', '', name).strip()

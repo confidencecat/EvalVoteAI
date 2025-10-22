@@ -2,6 +2,7 @@
 import os
 import json
 import re
+import sys
 
 import random
 import shutil
@@ -23,8 +24,6 @@ from config import (
     SYS_SYSTEM,
     SYS_FINE,
     SUB_SYSTEM,
-    SYS1_DIALOG_SYSTEM,
-    SYS2_SUMMARIZER_SYSTEM,
     build_sub_prompt,
     build_vote_prompt,
     _strip_code_fence,
@@ -38,9 +37,11 @@ set_korean_font()
 keyword_num = 4
 keyword_choices_num = 3
 
+
 def sys_generate_keywords(sys_key, subgroup):
     global keyword_num
     target = subgroup['count'] * keyword_num
+    print(f"[DEBUG] 키워드 생성 시작 - 목표: {target}개")
     prompt = (
         f"[소그룹 특징] {subgroup['info']}\n"
         f"[공동 요소] {subgroup['common']}\n"
@@ -50,6 +51,7 @@ def sys_generate_keywords(sys_key, subgroup):
         f"지시: 쉼표로만 구분된 키워드를 정확히 {target}개 생성"
     )
     txt = call_ai(prompt, SYS_SYSTEM, fine=SYS_FINE, api_key=sys_key)
+    print(f"[DEBUG] AI 키워드 응답 받음 - 길이: {len(txt)}")
 
     kws_raw = [w.strip() for w in txt.split(',') if w.strip()]
     seen, uniq = set(), []
@@ -58,22 +60,31 @@ def sys_generate_keywords(sys_key, subgroup):
             seen.add(w)
             uniq.append(w)
     kws = uniq
+    print(f"[DEBUG] 중복 제거 후 키워드 수: {len(kws)}")
+    
     if len(kws) >= target:
+        print(f"[DEBUG] 키워드 충분 - {target}개 선택")
         return kws[:target]
     if len(kws) == 0:
+        print(f"[WARNING] 키워드 생성 실패 - 기본 키워드 사용")
         kws = [f"키워드_{i+1}" for i in range(target)]
     else:
+        print(f"[DEBUG] 키워드 부족 - 랜덤 복제하여 {target}개 맞춤")
         while len(kws) < target:
             kws.append(random.choice(uniq))
     return kws[:target]
 
 
 def create_one_persona(subgroup, pick_num, sub_key, name_counts, group_dir):
+    print(f"[DEBUG] 페르소나 생성 시작 - 키워드: {pick_num}")
     txt = call_ai(build_sub_prompt(subgroup, pick_num), SUB_SYSTEM, api_key=sub_key)
+    print(f"[DEBUG] AI 응답 받음 - 길이: {len(txt)}")
     try:
         data = extract_json_array(txt)
         p = data[0]
-    except Exception:
+        print(f"[DEBUG] JSON 파싱 성공 - 이름: {p.get('name', 'Unknown')}")
+    except Exception as e:
+        print(f"[DEBUG] JSON 파싱 실패: {e}")
         p = {
             "name": "Persona",
             "mind": "다양한 관점과 합리적 사고를 중시합니다.",
@@ -92,6 +103,7 @@ def create_one_persona(subgroup, pick_num, sub_key, name_counts, group_dir):
 
     if not os.path.exists(mem_path):
         save_json(mem_path, [])
+        print(f"[DEBUG] 메모리 파일 생성: {mem_path}")
 
     p['name'] = idx
     p['file'] = mem_path
@@ -103,50 +115,79 @@ def create_one_persona(subgroup, pick_num, sub_key, name_counts, group_dir):
         f"행동 : {p['action']}\n"
         f"특징 : {p['character']}"
     )
+    print(f"[DEBUG] 페르소나 생성 완료: {idx}")
     return p
 
 
-def create_personas_for_subgroup(subgroup, keywords, sub_keys, name_counts, group_dir):
+def create_personas_for_subgroup(subgroup, keywords, sub_key, name_counts, group_dir):
+    """단일 API 키를 사용하여 병렬로 페르소나를 생성합니다."""
     global keyword_choices_num
     total = subgroup['count']
     all_p = []
-    K = max(1, len(sub_keys))
-
-    for start in range(0, total, K):
-        end = min(start + K, total)
-        with ThreadPoolExecutor(max_workers=K) as ex:
+    
+    # 병렬 처리할 배치 크기 설정 (동시에 처리할 작업 수)
+    batch_size = 10  # API 제한을 고려하여 5개씩 병렬 처리
+    
+    print(f"[DEBUG] 소그룹 '{subgroup['name']}' - 총 {total}명 생성, 배치 크기: {batch_size}")
+    
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        print(f"[DEBUG] 배치 처리 중: {start+1}~{end}번째 페르소나")
+        
+        with ThreadPoolExecutor(max_workers=batch_size) as ex:
             futures = []
             for i in range(start, end):
-                pick_num = random.sample(keywords, keyword_choices_num) if keyword_choices_num >= 3 else keywords[:]
-                key = sub_keys[(i - start) % K]
-                futures.append(ex.submit(create_one_persona, subgroup, pick_num, key, name_counts, group_dir))
-            for fut in as_completed(futures):
-                all_p.append(fut.result())
+                pick_num = random.sample(keywords, keyword_choices_num) if len(keywords) >= keyword_choices_num else keywords[:]
+                print(f"[DEBUG] {i+1}번째 페르소나 작업 제출 - 키워드: {pick_num}")
+                futures.append(ex.submit(create_one_persona, subgroup, pick_num, sub_key, name_counts, group_dir))
+            
+            for idx, fut in enumerate(as_completed(futures)):
+                try:
+                    result = fut.result()
+                    all_p.append(result)
+                    print(f"[DEBUG] {start+idx+1}번째 페르소나 완료: {result['name']}")
+                except Exception as e:
+                    print(f"[ERROR] 페르소나 생성 실패: {e}")
 
-    print(f"<[ {subgroup['name']} ]  제작 완료>")
+    print(f"<[ {subgroup['name']} ]  제작 완료 - 총 {len(all_p)}명>")
     return all_p
 
 
 def ask_one_persona(p, sub_key, qtext):
+    print(f"[DEBUG] 페르소나 '{p['name']}'에게 질문 중...")
     reply = call_ai_with_memory(build_vote_prompt(qtext), p['system'], p['file'], sub_key, memory_limit=10)
+    print(f"[DEBUG] 페르소나 '{p['name']}' 응답 완료")
     parts = reply.strip().split('\n', 1)
     reason = parts[0].strip() if parts else ''
     num = parts[1].strip() if len(parts) > 1 else ''
     return {'name': p['name'], 'reason': reason, 'number': num}
 
 
-def ask_many(personas, sub_keys, qtext):
-    K = max(1, len(sub_keys))
+def ask_many(personas, sub_key, qtext):
+    """단일 API 키를 사용하여 병렬로 페르소나에게 질문합니다."""
     out = []
-    for start in range(0, len(personas), K):
-        end = min(start + K, len(personas))
-        with ThreadPoolExecutor(max_workers=K) as ex:
+    batch_size = 20
+    
+    print(f"[DEBUG] 총 {len(personas)}명의 페르소나에게 질문, 배치 크기: {batch_size}")
+    
+    for start in range(0, len(personas), batch_size):
+        end = min(start + batch_size, len(personas))
+        print(f"[DEBUG] 배치 처리 중: {start+1}~{end}번째 페르소나")
+        
+        with ThreadPoolExecutor(max_workers=batch_size) as ex:
             futures = []
             for i in range(start, end):
-                key = sub_keys[(i - start) % K]
-                futures.append(ex.submit(ask_one_persona, personas[i], key, qtext))
-            for fut in as_completed(futures):
-                out.append(fut.result())
+                futures.append(ex.submit(ask_one_persona, personas[i], sub_key, qtext))
+            
+            for idx, fut in enumerate(as_completed(futures)):
+                try:
+                    result = fut.result()
+                    out.append(result)
+                    print(f"[DEBUG] {start+idx+1}번째 응답 완료: {result['name']}")
+                except Exception as e:
+                    print(f"[ERROR] 페르소나 질문 실패: {e}")
+    
+    print(f"[DEBUG] 전체 응답 완료 - 총 {len(out)}개")
     return out
 
 
@@ -215,9 +256,9 @@ def modify_group_flow():
     - 삭제 시 PERSONA.json의 해당 소그룹 소속 페르소나와 각 MEMORY/*.json을 모두 제거합니다.
     - 추가 시 기존 생성 로직과 동일하게 키워드 생성 → 페르소나 생성 → PERSONA.json 갱신을 수행합니다.
     """
-    sys_keys, sub_keys = load_api_keys()
-    if not sub_keys:
-        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
+    sys_key, sub_key = load_api_keys()
+    if not sub_key:
+        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_KEY를 등록해 주세요.")
         return
 
     group_name = input("수정할 페르소나 집단 이름: ").strip()
@@ -243,7 +284,6 @@ def modify_group_flow():
                 'count': count,
                 'diversity': diversity,
             }
-            sys_key = (sys_keys[len(personas) % len(sys_keys)]) if sys_keys else sub_keys[0]
             kws = sys_generate_keywords(sys_key, subgroup)
 
             name_counts = {}
@@ -253,7 +293,7 @@ def modify_group_flow():
                 n = int(p['name'].rsplit('_', 1)[1]) if '_' in p['name'] else 0
                 name_counts[base] = max(name_counts.get(base, 0), n)
 
-            new_ps = create_personas_for_subgroup(subgroup, kws, sub_keys, name_counts, group_dir)
+            new_ps = create_personas_for_subgroup(subgroup, kws, sub_key, name_counts, group_dir)
             personas.extend(new_ps)
             save_json(persona_path, personas)
             print(f"[추가 완료] '{name}' 소그룹에서 {len(new_ps)}명 생성 및 저장")
@@ -294,98 +334,10 @@ def modify_group_flow():
             print('잘못된 입력입니다.')
 
 
-def auto_generate_group_flow():
-    """NEW: 4) 자동 생성 플로우
-    - SYS_1과 사용자 대화(quit 입력까지). 대화 로그를 group_dir/AUTO/dialog.jsonl로 저장.
-    - SYS_2가 로그를 읽어 소그룹 설계 JSON을 산출.
-    - 산출 결과를 그대로 사용해 소그룹별 키워드 생성 및 페르소나 생성 자동 실행.
-    """
-    sys_keys, sub_keys = load_api_keys()
-    if not sub_keys:
-        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
-        return
-
-    if not sys_keys:
-        print("SYS 키(SYS_1, SYS_2)가 필요합니다. .env에 SYS_1, SYS_2를 등록하세요.")
-        return
-
-    sys1_key = sys_keys[0]
-    sys2_key = sys_keys[1] if len(sys_keys) >= 2 else sys_keys[0]
-
-    group_name = input("자동 생성할 페르소나 집단 이름: ").strip()
-    group_dir = os.path.join('.', sanitize_folder(group_name))
-    os.makedirs(group_dir, exist_ok=True)
-
-    auto_dir = os.path.join(group_dir, 'AUTO')
-    os.makedirs(auto_dir, exist_ok=True)
-    dialog_path = os.path.join(auto_dir, 'dialog.jsonl')
-
-    print("[SYS_1 대화 모드 시작] 필요 정보를 말씀해 주세요. (종료: quit)")
-    genai.configure(api_key=sys1_key)
-    model1 = genai.GenerativeModel(GEMINI_MODEL, system_instruction=SYS1_DIALOG_SYSTEM)
-    chat1 = model1.start_chat(history=[])
-
-    dialog = []
-    first = chat1.send_message("사용자 요구 파악을 위한 첫 질문을 해주세요.")
-    first_txt = first._result.candidates[0].content.parts[0].text.strip()
-    print(f"SYS_1: {first_txt}")
-    dialog.append({'role': 'assistant', 'content': first_txt})
-
-    while True:
-        user_in = input("YOU: ")
-        if user_in.strip().lower() == 'quit':
-            break
-        dialog.append({'role': 'user', 'content': user_in})
-        resp = chat1.send_message(user_in)
-        txt = resp._result.candidates[0].content.parts[0].text.strip()
-        print(f"SYS_1: {txt}")
-        dialog.append({'role': 'assistant', 'content': txt})
-
-    with open(dialog_path, 'w', encoding='utf-8') as f:
-        for turn in dialog:
-            f.write(json.dumps(turn, ensure_ascii=False) + "\n")
-    print(f"[저장] 대화 로그 → {dialog_path}")
-
-    transcript = history_str(dialog)
-    print("[SYS_2] 대화 내용을 바탕으로 소그룹 설계를 생성합니다...")
-    summary_txt = call_ai(transcript, SYS2_SUMMARIZER_SYSTEM, api_key=sys2_key)
-    try:
-        subgroups = extract_json_array(summary_txt)
-    except Exception:
-        print("[경고] SYS_2 출력 파싱 실패. 빈 소그룹 목록으로 진행합니다.")
-        subgroups = []
-
-    persona_path = os.path.join(group_dir, 'PERSONA.json')
-    personas = load_json(persona_path)
-    name_counts = {}
-    for p in personas:
-        base = p['name'].rsplit('_', 1)[0]
-        n = int(p['name'].rsplit('_', 1)[1]) if '_' in p['name'] else 0
-        name_counts[base] = max(name_counts.get(base, 0), n)
-
-    for idx, sg in enumerate(subgroups):
-        subgroup = {
-            'name': str(sg.get('name', f'Subgroup_{idx+1}')),
-            'info': str(sg.get('info', '')),
-            'common': str(sg.get('common', '')),
-            'count': int(sg.get('count', 0) or 0),
-            'diversity': str(sg.get('diversity', '')),
-        }
-        if subgroup['count'] <= 0:
-            print(f"[스킵] '{subgroup['name']}' count가 0이어서 건너뜁니다.")
-            continue
-        sys_key = (sys_keys[idx % len(sys_keys)]) if sys_keys else sub_keys[0]
-        kws = sys_generate_keywords(sys_key, subgroup)
-        new_ps = create_personas_for_subgroup(subgroup, kws, sub_keys, name_counts, group_dir)
-        personas.extend(new_ps)
-
-    save_json(persona_path, personas)
-    print(f"[완료] 자동 생성 종료. 현재 총 페르소나 수: {len(personas)}명")
-
 def ask_flow():
-    _, sub_keys = load_api_keys()
-    if not sub_keys:
-        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
+    _, sub_key = load_api_keys()
+    if not sub_key:
+        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_KEY를 등록해 주세요.")
         return
 
     group_name = input("불러올 집단 이름: ").strip()
@@ -402,7 +354,7 @@ def ask_flow():
         n = int(input("질문 수: ").strip())
         qs = [input(f"{i+1}번째 질문: ").strip() for i in range(n)]
         for q in qs:
-            res = ask_many(personas, sub_keys, q)
+            res = ask_many(personas, sub_key, q)
             save_vote_outputs(group_dir, q, res)
         print("-시스템 종료-")
     else:
@@ -410,26 +362,23 @@ def ask_flow():
             q = input("> ").strip()
             if q.lower() == 'exit':
                 return
-            res = ask_many(personas, sub_keys, q)
+            res = ask_many(personas, sub_key, q)
             save_vote_outputs(group_dir, q, res)
             print("-응답 저장 완료-")
 
 
 def create_group_flow():
-    sys_keys, sub_keys = load_api_keys()
-    if not sub_keys:
-        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_1.. 또는 API_1.. 형식으로 등록해 주세요.")
+    sys_key, sub_key = load_api_keys()
+    if not sub_key:
+        print("SUB(API) 키를 찾을 수 없습니다. .env에 SUB_KEY를 등록해 주세요.")
         return
 
-    mode = input("1) 페르소나 집단 제작  2) 질문하기  3) 기존 집단 수정  4) 집단 자동 생성  [1/2/3/4]: ").strip()
+    mode = input("1) 페르소나 집단 제작  2) 질문하기  3) 기존 집단 수정  [1/2/3]: ").strip()
     if mode == '2':
         ask_flow()
         return
     if mode == '3':
         modify_group_flow()
-        return
-    if mode == '4':
-        auto_generate_group_flow()
         return
 
     group_name = input("페르소나 집단의 이름: ").strip()
@@ -458,12 +407,31 @@ def create_group_flow():
 
     # 소그룹은 순차 처리, 각 소그룹 내부는 ThreadPoolExecutor로 동시 생성
     for idx, sg in enumerate(subgroups):
-        sys_key = (sys_keys[idx % len(sys_keys)]) if sys_keys else sub_keys[0]
+        print(f"\n[DEBUG] 소그룹 {idx+1}/{len(subgroups)} 처리 시작: {sg['name']}")
         kws = sys_generate_keywords(sys_key, sg)
-        personas = create_personas_for_subgroup(sg, kws, sub_keys, name_counts, group_dir)
+        print(f"[DEBUG] 키워드 생성 완료: {len(kws)}개")
+        personas = create_personas_for_subgroup(sg, kws, sub_key, name_counts, group_dir)
+        print(f"[DEBUG] 소그룹 페르소나 생성 완료: {len(personas)}명")
         all_personas.extend(personas)
+        print(f"[DEBUG] 누적 페르소나 수: {len(all_personas)}명")
 
-    save_json(os.path.join(group_dir, 'PERSONA.json'), all_personas)
+    persona_file = os.path.join(group_dir, 'PERSONA.json')
+    print(f"\n[DEBUG] PERSONA.json 저장 시작: {persona_file}")
+    print(f"[DEBUG] 저장할 페르소나 수: {len(all_personas)}명")
+    
+    # 페르소나 데이터 샘플 출력
+    if all_personas:
+        print(f"[DEBUG] 첫 번째 페르소나 샘플: name={all_personas[0].get('name')}, subgroup={all_personas[0].get('subgroup')}")
+    
+    save_json(persona_file, all_personas)
+    
+    # 저장 확인
+    if os.path.exists(persona_file):
+        saved_data = load_json(persona_file)
+        print(f"[DEBUG] PERSONA.json 저장 확인 완료: {len(saved_data)}명 저장됨")
+    else:
+        print(f"[ERROR] PERSONA.json 파일이 생성되지 않았습니다!")
+    
     print(f"\n[완료] 모든 소그룹 제작이 종료되었습니다. ({len(all_personas)}명)")
 
 
